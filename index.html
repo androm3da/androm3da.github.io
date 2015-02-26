@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset='utf-8'>
+    <meta http-equiv="X-UA-Compatible" content="chrome=1">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+    <link href='https://fonts.googleapis.com/css?family=Architects+Daughter' rel='stylesheet' type='text/css'>
+    <link rel="stylesheet" type="text/css" href="stylesheets/stylesheet.css" media="screen">
+    <link rel="stylesheet" type="text/css" href="stylesheets/pygment_trac.css" media="screen">
+    <link rel="stylesheet" type="text/css" href="stylesheets/print.css" media="print">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+
+    <title>Androm3da.GitHub.io by androm3da</title>
+  </head>
+
+  <body>
+    <header>
+      <div class="inner">
+        <h1>Androm3da.GitHub.io</h1>
+        <h2></h2>
+        <a href="https://github.com/androm3da" class="button"><small>Follow me on</small> GitHub</a>
+      </div>
+    </header>
+
+    <div id="content-wrapper">
+      <div class="inner clearfix">
+        <section id="main-content">
+          <h2>
+<a id="clang" class="anchor" href="#clang" aria-hidden="true"><span class="octicon octicon-link"></span></a>Clang</h2>
+
+<p>I am impressed by <code>clang</code>, so I had a desire to learn more about its <code>libTooling</code>.  I figured it would be valuable to learn how to exploit this toolkit and it would make me a more effective promoter.</p>
+
+<p><code>scan-build</code> is a static analysis utility from the <code>clang</code> suite.  It comes with a large set of pre-defined checks for catching various errors.  There is a plugin interface for <code>scan-build</code> that doesn't look too difficult to take advantage of.  That way teams can design their own checkers to suit their needs.  In fact, the llvm dev team has done just that -- created a <code>llvm.Conventions</code> checker for their team to verify that submissions conform to their development conventions.</p>
+
+<p>I've worked on large teams that span several countries.  Even with relatively well-described standards for coding, human code reviews don't always catch some classic errors that the standards are designed to catch.</p>
+
+<p>The output of <code>scan-build</code> can be simple text at the command line or a handy HTML report.  The latter is easier to navigate for large code bases or reports that follow a tortuous path to the offending code.</p>
+
+<p>If you're not interested in this article, you can <a href="https://github.com/androm3da/sample-checker">skip the prose and go straight to the code</a>.</p>
+
+<h2>
+<a id="sample-problem" class="anchor" href="#sample-problem" aria-hidden="true"><span class="octicon octicon-link"></span></a>Sample Problem</h2>
+
+<p>For CPU-bound performance critical code, a classic source of suboptimal code is when floating-point literals end up promoting some computation to use double-precision.</p>
+
+<p>Here's the difference between the code generated for <code>x * 100.</code> vs <code>x * 100.f</code>:</p>
+
+<pre><code>:::asm
+float.o:     file format elf64-x86-64                           |  double.o:     file format elf64-x86-64
+
+
+Disassembly of section .text:                                      Disassembly of section .text:
+
+0000000000000000 &lt;transformInput&gt;:                                 0000000000000000 &lt;transformInput&gt;:
+
+                                                                &gt;
+float transformInput(float x)                                      float transformInput(float x)
+{                                                                  {
+   0:   55                      push   %rbp                           0:   55                      push   %rbp
+   1:   48 89 e5                mov    %rsp,%rbp                      1:   48 89 e5                mov    %rsp,%rbp
+   4:   48 b8 64 00 00 00 00    movabs $0x64,%rax                     4:   48 b8 64 00 00 00 00    movabs $0x64,%rax
+   b:   00 00 00                                                      b:   00 00 00 
+   e:   f3 48 0f 2a c8          cvtsi2ss %rax,%xmm1             |     e:   f2 48 0f 2a c8          cvtsi2sd %rax,%xmm1
+  13:   f3 0f 11 45 fc          movss  %xmm0,-0x4(%rbp)              13:   f3 0f 11 45 fc          movss  %xmm0,-0x4(%rbp)
+    return x * 100.f;                                           |      return x * 100.;
+  18:   f3 0f 10 45 fc          movss  -0x4(%rbp),%xmm0         |    18:   f3 0f 5a 45 fc          cvtss2sd -0x4(%rbp),%xmm0
+  1d:   f3 0f 59 c1             mulss  %xmm1,%xmm0              |    1d:   f2 0f 59 c1             mulsd  %xmm1,%xmm0
+  21:   5d                      pop    %rbp                     |    21:   f2 0f 5a c0             cvtsd2ss %xmm0,%xmm0
+  22:   c3                      retq                            |    25:   5d                      pop    %rbp
+</code></pre>
+
+<p>Those extra <code>cvtsx2sx</code> instructions are required to promote the arithmetic to use double-precision.  For the most part, that work is useless because we convert back to single-precision for the return value.  This can cost us dearly if this code ends up in an inner loop.  So that pesky literal is very pernicious.</p>
+
+<p>This problem is well known, so <code>gcc</code> already has a warning (<code>-Wdouble-promotion</code>) designed to be on the lookout for this.  Also, <code>-fsingle-precision-constant</code> exists to force the single-precision behavior.</p>
+
+<p>Regardless of the existing features, this seems like a simple enough use case to get my feet wet with writing a Clang Checker.</p>
+
+<h2>
+<a id="building-the-checker-library" class="anchor" href="#building-the-checker-library" aria-hidden="true"><span class="octicon octicon-link"></span></a>Building the checker library</h2>
+
+<p>I started off with Ubuntu 14.04.1 (<code>trusty</code>) and <code>clang-3.5</code>.  Ubuntu's popularity practically guarantees me that someone else has tried this before me.  That said, I've also had some luck building from source on older platforms like SLES11 SP3.  I'll focus on ubuntu now because the process is significantly simpler.</p>
+
+<p>After encountering compilation errors with 3.5, I backed off to 3.4 and everything worked well.  Start with:</p>
+
+<pre><code>sudo apt-get install llvm-3.4-dev clang-3.4 libclang-3.4-dev
+</code></pre>
+
+<p>I created a mostly-empty <code>Checker</code> that would emit a bug at almost any code I threw at it as a "Hello World."  I tried to start with <code>cmake</code> for building the <code>Checker</code> but I ran into challenges there.  Since this was pretty much my first experience building something myself with <code>cmake</code> I decided that it wasn't critical.  I know GNU <code>make</code>, so I just shifted gears and created a <code>Makefile</code>.  If you need features only present on newer releases, I'd recommend just building from source where you likely won't encounter any of these problems.  You're also in a better position in getting support from the community than you are when you use Canonical's packages.  Note that you may find subtle incompatibilities among releases.</p>
+
+<pre><code>:::make
+LLVM_VER:=3.4
+LLVM_CXXFLAGS:=$(shell llvm-config-$(LLVM_VER) --cxxflags)
+LLVM_LDFLAGS:=$(shell llvm-config-$(LLVM_VER) --ldflags --libs )
+
+CLANG_LIBS:= \
+    -Wl,--start-group \
+    -lclangAST \
+    -lclangAnalysis \
+    -lclangBasic \
+    -lclangDriver \
+    -lclangEdit \
+    -lclangFrontend \
+    -lclangFrontendTool \
+    -lclangLex \
+    -lclangParse \
+    -lclangSema \
+    -lclangEdit \
+    -lclangASTMatchers \
+    -lclangRewriteFrontend \
+    -lclangStaticAnalyzerFrontend \
+    -lclangStaticAnalyzerCheckers \
+    -lclangStaticAnalyzerCore \
+    -lclangSerialization \
+    -lclangTooling \
+    -Wl,--end-group \
+    $()
+
+CXXFLAGS=-fno-rtti -Wall -g -std=c++11
+
+CXXFLAGS+=$(LLVM_CXXFLAGS)
+LDFLAGS+=$(LLVM_LDFLAGS) -shared
+
+LOADLIBES+=-lstdc++
+LOADLIBES+=$(CLANG_LIBS)
+
+libfloatcheck.so: float-check.o
+    $(CXX) $(LDFLAGS) $^ $(LOADLIBES) $(LDLIBS) -o $@
+</code></pre>
+
+<p>Here's our simple checker to test the build:</p>
+
+<pre><code>:::c++
+namespace {
+    class FloatExcessPrecisionChecker: public Checker &lt;check::Bind,
+                                                        &gt; 
+    {
+        mutable std::unique_ptr&lt;BugType&gt; bugType;
+
+        public:
+            FloatExcessPrecisionChecker() 
+                : bugType(new BugType("Excess floating-point precision", "androm3da analyzer"))
+            {
+            }
+
+            void checkBind(SVal     Loc,
+                           SVal     Val,
+                           const Stmt *Statement,
+                           CheckerContext &amp;ctxt
+                           )        const;
+    };
+} 
+
+void FloatExcessPrecisionChecker::checkBind(SVal    Loc,
+                       SVal     Val,
+                       const Stmt *Statement,
+                       CheckerContext &amp;ctxt
+                       )        const
+{
+    ExplodedNode  *loc = ctxt.generateSink();
+
+    BugReport *bug = new BugReport(*this-&gt;bugType, "all bugs all the time", loc);
+    ctxt.emitReport(bug);
+}
+
+extern "C"
+const char clang_analyzerAPIVersionString[] = CLANG_ANALYZER_API_VERSION_STRING;
+
+extern "C"
+void clang_registerCheckers(CheckerRegistry &amp;registry) {
+  registry.addChecker&lt;FloatExcessPrecisionChecker&gt;("performance.crit.ExcessPrecision", "float ...");
+}
+</code></pre>
+
+<p>The most interesting part so far is the <code>checkBind()</code> method inherited from <code>clang::ento::Checker&lt;&gt;</code>.  Our Checker's flow is primarily dictated by the specialization of the <code>Checker</code> we're inheriting from.  <code>check::Bind</code> hooks "<a href="http://clang.llvm.org/doxygen/classclang_1_1ento_1_1CheckerDocumentation.html#a42aac3963fb75b8656ce38b10476e03f">binding of a value to a location</a>."  In my experience with vanilla test code, this is typically assignments.  The CheckerDocumentation is an excellent basis for understanding how your <code>Checker</code> is integrated with the overall ecosystem.</p>
+
+<p><code>ctxt.generateSink()</code> tells the analyzer not to consider anything else in this path for this checker.</p>
+
+<h2>
+<a id="taking-a-test-drive" class="anchor" href="#taking-a-test-drive" aria-hidden="true"><span class="octicon octicon-link"></span></a>Taking a test drive</h2>
+
+<p>We can invoke our checker using <code>scan-build</code> or <code>clang</code>:</p>
+
+<pre><code>scan-build -load-plugin ~/src/floatcheck/libfloatcheck.so -enable-checker performance.crit.ExcessPrecision make -C test/ --always-make
+</code></pre>
+
+<p>Running this one yields the following output:</p>
+
+<pre><code>:::text
+scan-build: Using '/usr/bin/clang' for static analysis
+make[1]: Entering directory `/home/androm3da/src/floatcheck/test'
+/usr/share/clang/scan-build/c++-analyzer    -c -o test_one.o test_one.cpp
+test_one.cpp:28:2: warning: all bugs all the time
+        int j = i + 33.f;
+        ^~~~~
+test_one.cpp:35:2: warning: all bugs all the time
+        int j = i + 100;
+        ^~~~~
+</code></pre>
+
+<p><code>scan-build</code> works similarly to some commercial static analysis tools in that it watches your build and deduces how to get the analysis in the correct context.  This is necessary for C/C++ because you can't even create the <a href="http://en.wikipedia.org/wiki/Abstract_syntax_tree">AST</a> for a translation unit without the <code>define</code>s, <code>include</code>s and other compiler arguments.  It's valuable because <code>scan-build</code> might generate false positives or false negatives if it were used with a different context.</p>
+
+<h2>
+<a id="designing-a-useful-checker" class="anchor" href="#designing-a-useful-checker" aria-hidden="true"><span class="octicon octicon-link"></span></a>Designing a useful checker</h2>
+
+<p><code>checkBind</code> was a good sanity-check, perhaps useful if we wanted to look at all assignments.  But it's probably simpler to just zoom in on any floating point literals that we come across.  So we'll ditch the <code>check::Bind</code> and add a <code>check::PostStmt&lt;FloatingLiteral&gt;</code>.  This will invoke <code>checkPostStmt()</code>, so let's override that method to match:</p>
+
+<pre><code>:::C++
+void FloatExcessPrecisionChecker::checkPostStmt(const FloatingLiteral *fl, CheckerContext &amp;ctxt) const
+{
+    const bool is_double =  &amp;fl-&gt;getSemantics() == &amp;APFloat::IEEEdouble;
+    const bool foundbug = is_double;
+
+    if (foundbug)
+    {
+        ExplodedNode  *loc = ctxt.generateSink();
+
+        BugReport *bug = new BugReport(*this-&gt;bugType, 
+                "literal w/double precision, may impact performance", loc);
+        ctxt.emitReport(bug);
+    }
+}
+</code></pre>
+
+<p>Let 'er rip on the test code:</p>
+
+<pre><code>:::text
+scan-build: Using '/usr/bin/clang' for static analysis
+make[1]: Entering directory `/home/androm3da/src/floatcheck/test'
+/usr/share/clang/scan-build/c++-analyzer    -c -o test_one.o test_one.cpp
+test_one.cpp:12:14: warning: literal w/double precision, may impact performance
+        int j = i + 100.;
+                    ^~~~
+</code></pre>
+
+<p>Ok, so we're in business.  But so far, we're not really exploiting the power of the checker.  Let's see if we can find a way to let folks intentionally use a <code>double</code>-precision literal without setting off our checker.  C++ has a pretty good mechanism of letting coders signify their intent for a type.  We'll (ab)use the explicit cast to suggest that this use of higher-precision literals is by design.</p>
+
+<pre><code>:::C++
+void FloatExcessPrecisionChecker::checkPostStmt(const FloatingLiteral *fl, CheckerContext &amp;ctxt) const
+{
+    auto parents = ctxt.getASTContext().getParents(*fl);
+    const bool is_intentional = !parents.empty() 
+        &amp;&amp; parents[0].get&lt;CXXStaticCastExpr&gt;() != nullptr 
+        &amp;&amp; parents[0].get&lt;CXXStaticCastExpr&gt;()-&gt;getTypeAsWritten().getAsString() == "double";
+    const bool is_double =  &amp;fl-&gt;getSemantics() == &amp;APFloat::IEEEdouble;
+    const bool foundbug = !is_intentional &amp;&amp; is_double;
+
+    if (foundbug)
+    {
+        ExplodedNode  *loc = ctxt.generateSink();
+
+        BugReport *bug = new BugReport(*this-&gt;bugType, 
+                "literal w/double precision, may impact performance", loc);
+        ctxt.emitReport(bug);
+    }
+}
+</code></pre>
+
+<p>A <code>FloatingLiteral</code> is-a <code>Stmt</code>, we look at its parents to determine whether the immediate parent is a <code>static_cast&lt;&gt;</code>.</p>
+
+<p>Here's our test case with an explicit cast:</p>
+
+<pre><code>:::C++
+int some_intentional_dbl_func(int i) {
+    int j = i + static_cast&lt;double&gt;(100.);
+
+    return j - 12;
+}
+</code></pre>
+
+<p>But it doesn't trigger our warning, just as we'd like:</p>
+
+<pre><code>scan-build: Using '/usr/bin/clang' for static analysis
+make[1]: Entering directory `/home/brian/src/floatcheck/test'
+/usr/share/clang/scan-build/c++-analyzer    -c -o test_one.o test_one.cpp
+test_one.cpp:12:14: warning: literal w/double precision, may impact performance
+        int j = i + 100.;
+                    ^~~~
+1 warning generated.
+</code></pre>
+
+<h2>
+<a id="follow-up-other-notes" class="anchor" href="#follow-up-other-notes" aria-hidden="true"><span class="octicon octicon-link"></span></a>Follow up, other notes</h2>
+
+<p>I was able to whip up this example by doing a great deal of wandering around clang's API documentation.  It's an excellent resource.  The llvm, clang projects move really fast, sometimes without regard to backwards compatibility of these interfaces.  Although I didn't notice any incompatibilities between what's documented at <a href="http://clang.llvm.org/doxygen/">http://clang.llvm.org/doxygen/</a> and the llvm-3.4 install that I used for this article.</p>
+
+<p>This is still a pretty low complexity checker that you could probably get from AST analysis alone.  But it's a great starting point for further work.  We could expand our search to any high-precision operands or pass/return values.  Also, it would be useful to further narrow our search domain to only what the user considers performance critical code.  I'd like to only consider methods which are declared in classes which have a class with the name "PerfCritical" among its ancestors.  That way, builders could apply this checker globally and users can opt-in to the checker only where appropriate.</p>
+
+<p>In searching for ancestors, I know I should probably try to get the <code>FunctionDecl</code> associated with this code.  But I couldn't find a way to get the associated <code>FunctionDecl</code> from the <code>Stmt</code>, <code>ASTContext</code>, etc values that I get at <code>checkPostStmt</code> or similar intercepts.  Assuming that there's no way to get there from here, an alternative is to build a list of violations found via <code>checkPostStmt</code> and use <code>CheckASTDecl</code> to find <code>FunctionDecl</code>s with a body and walk their children to match against <code>Stmt</code>s in our violation list.</p>
+
+<p>Those <code>generateSink()</code> calls are a handy way to get the appropriate location to highlight (necessary for the <code>BugReport</code>).  But their side-effect is to force the analyzer to stop searching this code path.  For this particular checker we'd probably prefer to continue our search.  I'll bet <code>ASTContext</code> or something similar has a way to get the <code>ExplodedNode</code> we need for <code>BugReport</code> without halting the search.</p>
+
+<h2>
+<a id="appendix" class="anchor" href="#appendix" aria-hidden="true"><span class="octicon octicon-link"></span></a>Appendix</h2>
+
+<p>[^1] <code>fatal error: 'llvm/ADT/iterator_range.h' file not found</code> when including <code>StaticAnalyzer/Core/Checker.h</code></p>
+
+<ul>
+<li>Clang's <a href="http://clang.llvm.org/doxygen/classclang_1_1ento_1_1CheckerDocumentation.html">Checker documentation</a>
+</li>
+<li>a <a href="https://github.com/awruef/find-heartbleed/">checker used to find the heartbleed bug</a>
+</li>
+<li><a href="https://github.com/eliben/llvm-clang-samples/">Eli Bendersky's samples of code to leverage llvm/clang</a></li>
+</ul>
+        </section>
+
+        <aside id="sidebar">
+
+
+          <p>This page was generated by <a href="https://pages.github.com">GitHub Pages</a> using the Architect theme by <a href="https://twitter.com/jasonlong">Jason Long</a>.</p>
+        </aside>
+      </div>
+    </div>
+
+  
+  </body>
+</html>
